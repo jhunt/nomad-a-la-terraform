@@ -1,0 +1,101 @@
+#!/bin/sh
+#
+# nomad-me-up - Install Nomad bits
+#
+# author:  James Hunt <james@niftylogic.com>
+# created: 2021-02-22
+#
+
+set -ue
+
+NOMAD_VERSION=${NOMAD_VERSION:-1.0.3}
+
+THIS_DATACENTER=dc1
+THIS_NODE=
+CLUSTER_SIZE=
+if [ -n "${3:-}" ]; then
+	THIS_DATACENTER=$1
+	THIS_NODE=$2
+	CLUSTER_SIZE=$3
+else
+	THIS_NODE=${1-}
+	CLUSTER_SIZE=${2:-}
+fi
+
+if [ -z ${THIS_NODE} ]; then
+	echo >&2 "USAGE: $0 [DATACENTER] NODE COUNT"
+	exit 1
+fi
+if [ -z ${CLUSTER_SIZE} ]; then
+	echo >&2 "USAGE: $0 [DATACENTER] NODE COUNT"
+	exit 1
+fi
+
+# get the software
+apt-get update
+apt-get install -y curl ca-certificates unzip jq \
+    apt-transport-https gnupg-agent software-properties-common
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
+add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+apt-get update
+apt-get install -y docker-ce docker-ce-cli containerd.io
+
+curl -sL -o /tmp/nomad.zip \
+  https://releases.hashicorp.com/nomad/${NOMAD_VERSION}/nomad_${NOMAD_VERSION}_linux_amd64.zip
+unzip -d /usr/local/bin /tmp/nomad.zip nomad
+rm -f /tmp/nomad.zip
+
+# create a user
+useradd nomad
+usermod -aG docker nomad
+mkdir -p /srv/nomad /etc/nomad
+chown -R nomad:nomad /srv/nomad
+
+# configure nomad
+cat > /etc/nomad/default.hcl <<EOF
+datacenter = "$THIS_DATACENTER"
+name       = "$THIS_NODE"
+bind_addr  = "0.0.0.0"
+
+client {
+  enabled = true
+}
+
+server {
+  enabled = true
+  bootstrap_expect = $CLUSTER_SIZE
+}
+
+consul {
+  address = "127.0.0.1:8500"
+}
+EOF
+
+# generate systemd unit file
+cat > /etc/systemd/system/nomad.service <<EOF
+[Unit]
+Description="HashiCorp Nomad"
+Documentation=https://www.nomadproject.io/
+Requires=network-online.target
+After=network-online.target
+ConditionalFileNotEmpty=/etc/nomad/default.hcl
+
+[Service]
+User=nomad
+Group=nomad
+ExecStart=/usr/local/bin/nomad agent -config /etc/nomad -data-dir /srv/nomad
+ExecReload=/bin/kill --signal HUP \$MAINPID
+KillMode=process
+Restart=on-failure
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable nomad.service
+systemctl start nomad.service
+
+# remove this script
+#rm -f $0
